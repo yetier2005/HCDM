@@ -1,0 +1,163 @@
+# =============================================================================
+# HCDM: Default Configuration
+# All hyperparameters with documentation.
+#
+# Usage: python scripts/distill.py --config configs/default.yaml --ipc 10
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Model Configuration
+# ---------------------------------------------------------------------------
+model:
+  # DiT model name (HuggingFace) or local path
+  dit_model_name: "facebook/DiT-XL-2-256"
+  # VAE model name or path (for encoding/decoding)
+  vae_model_name: "stabilityai/sd-vae-ft-mse"
+  # Input image size (square, pixels)
+  image_size: 256
+  # VAE latent channels
+  latent_channels: 4
+  # VAE downsampling factor (image_size / latent_size)
+  vae_scale_factor: 8
+  # DiT transformer hidden dimension
+  hidden_dim: 1152
+  # Number of DiT transformer blocks
+  num_blocks: 28
+  # Patch size for DiT patch embedding
+  patch_size: 2
+  # Number of attention heads
+  num_heads: 16
+  # Prediction type: "v_prediction" (DiT standard) or "epsilon"
+  prediction_type: "v_prediction"
+  # Use FP16 for VAE (saves memory)
+  use_fp16: true
+
+# ---------------------------------------------------------------------------
+# Distillation Configuration
+# ---------------------------------------------------------------------------
+distillation:
+  # Images Per Class (IPC): number of synthetic images per class
+  ipc: 10
+  # Number of DDIM sampling steps (fewer = faster, more = better quality)
+  ddim_steps: 50
+  # Number of timesteps used in DiT training (for schedule)
+  num_train_timesteps: 1000
+  # Classifier-free guidance scale (DiT works best with 1.25-1.5)
+  cfg_scale: 1.5
+  # Batch size for parallel generation within a class
+  batch_size: 10
+  # Deterministic DDIM (eta=0) or stochastic (eta>0)
+  deterministic: true
+  # Random seed for reproducibility
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# HCDM Hyperparameters
+# ---------------------------------------------------------------------------
+hcdm:
+  # Multi-level feature groups: {level_name: [start_block, end_block]}
+  # Splits DiT's 28 blocks into 3 semantic depth groups
+  layer_groups:
+    L1: [0, 8]      # Early blocks: local texture, fine details
+    L2: [9, 18]     # Middle blocks: part-level structure
+    L3: [19, 27]    # Late blocks: global semantics, class prototypes
+
+  # Strength of inter-class repulsion (0 = no repulsion)
+  lambda_repel: 0.3
+  # Strength of intra-batch diversity regularization (0 = no diversity constraint)
+  lambda_div: 0.1
+  # Minimum distance between synthetic samples in a batch
+  div_margin: 0.05
+
+  # Inter-class repulsion hinge margin
+  inter_margin: 0.5
+  # Number of hardest negative classes per step
+  topk_hard_negatives: 5
+
+  # MMD kernel: "rbf", "linear", "poly"
+  mmd_kernel: "rbf"
+  # Use median heuristic for RBF bandwidth
+  mmd_median_heuristic: true
+  # Fixed sigma (only when mmd_median_heuristic=false)
+  mmd_sigma: 1.0
+
+  # L2-normalize features before computing MMD
+  normalize_features: true
+  # Max gradient norm for HCDM guidance
+  grad_clip: 1.0
+  # Apply HCDM every N steps (1 = every step, 2 = every other)
+  guidance_every_n_steps: 1
+
+# ---------------------------------------------------------------------------
+# Guidance Schedule
+# ---------------------------------------------------------------------------
+guidance:
+  # Global guidance scale (peak value)
+  guidance_scale: 100.0
+
+  # Beta distribution parameters for global schedule:
+  #   - Higher values: guidance concentrated in the middle
+  #   - alpha=2, beta=2: symmetric bell curve
+  beta_alpha: 2.0
+  beta_beta: 2.0
+
+  # Per-level Gaussian window centers (as fraction of total steps)
+  # L1: peak late (~10%) — fine details, image nearly clean
+  # L2: peak mid (~40%) — part-level structure
+  # L3: peak early (~75%) — global semantics, still noisy
+  level_centers:
+    L1: 0.10
+    L2: 0.40
+    L3: 0.75
+
+  # Per-level Gaussian window sigmas (as fraction of total steps)
+  level_sigmas:
+    L1: 0.12
+    L2: 0.18
+    L3: 0.15
+
+  # Skip level if weight below this threshold
+  min_weight: 0.01
+
+# ---------------------------------------------------------------------------
+# Data Configuration
+# ---------------------------------------------------------------------------
+data:
+  # Dataset name (torchvision or custom)
+  dataset: "cifar10"
+  # Path to local dataset (auto-download if null)
+  data_path: null
+  # Number of classes in the dataset
+  num_classes: 10
+  # Real samples per class for feature pre-computation
+  samples_per_class: 500
+  # Batch size during pre-computation
+  precompute_batch_size: 32
+  # DataLoader workers
+  num_workers: 4
+  # Preprocessing: resize + center crop
+  preprocess_resize: 256
+  preprocess_crop: 256
+
+# ---------------------------------------------------------------------------
+# Output Configuration
+# ---------------------------------------------------------------------------
+output:
+  # Root output directory
+  output_dir: "./outputs"
+  # Experiment name (subdirectory)
+  exp_name: "hcdm_default"
+  # Use Weights & Biases logging
+  use_wandb: false
+  # Wandb project
+  wandb_project: "hcdm"
+  # Checkpoint directory (auto-created if null)
+  ckpt_dir: null
+  # Real features cache path
+  features_dir: null
+  # Log every N steps
+  log_interval: 10
+  # Save intermediate latents during generation
+  save_intermediate: false
+  # Format for saved distilled data: "pt" or "png"
+  save_format: "pt"

@@ -1,0 +1,83 @@
+# HCDM Configuration for CIFAR-10
+# 10 classes, 32×32 images
+#
+# Usage:
+#   Precompute features:
+#     python scripts/precompute_features.py --config configs/cifar10.yaml
+#   Distill:
+#     python scripts/distill.py --config configs/cifar10.yaml --ipc 10
+
+model:
+  dit_model_name: "facebook/DiT-XL-2-256"
+  vae_model_name: "stabilityai/sd-vae-ft-mse"
+  image_size: 256          # CIFAR images will be resized to 256
+  latent_channels: 4
+  vae_scale_factor: 8
+  hidden_dim: 1152
+  num_blocks: 28
+  patch_size: 2
+  num_heads: 16
+  prediction_type: "v_prediction"
+  use_fp16: false          # FP32 for stability on smaller datasets
+
+distillation:
+  ipc: 10
+  ddim_steps: 50
+  num_train_timesteps: 1000
+  cfg_scale: 1.5
+  batch_size: 10
+  deterministic: true
+  seed: 42
+
+hcdm:
+  layer_groups:
+    L1: [0, 8]
+    L2: [9, 18]
+    L3: [19, 27]
+
+  lambda_repel: 0.5         # Higher inter-class repulsion for CIFAR (more classes overlap)
+  lambda_div: 0.15          # Higher diversity constraint for smaller feature space
+  div_margin: 0.05
+  inter_margin: 0.5
+  topk_hard_negatives: 5
+  mmd_kernel: "rbf"
+  mmd_median_heuristic: true
+  mmd_sigma: 1.0
+  normalize_features: true
+  grad_clip: 1.0
+  guidance_every_n_steps: 1
+
+guidance:
+  guidance_scale: 150.0      # Higher guidance for smaller datasets
+  beta_alpha: 2.0
+  beta_beta: 2.0
+  level_centers:
+    L1: 0.10
+    L2: 0.40
+    L3: 0.75
+  level_sigmas:
+    L1: 0.12
+    L2: 0.18
+    L3: 0.15
+  min_weight: 0.01
+
+data:
+  dataset: "cifar10"
+  data_path: null
+  num_classes: 10
+  samples_per_class: 500     # Full training set per class
+  precompute_batch_size: 32
+  num_workers: 4
+  preprocess_resize: 256
+  preprocess_crop: 256
+
+output:
+  output_dir: "./outputs"
+  exp_name: "hcdm_cifar10"
+  use_wandb: false
+  wandb_project: "hcdm"
+  ckpt_dir: null
+  features_dir: "./outputs/cifar10_features.pt"
+  log_interval: 10
+  save_intermediate: false
+  save_format: "pt"

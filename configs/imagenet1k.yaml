@@ -1,0 +1,85 @@
+# HCDM Configuration for ImageNet-1K
+# 1000 classes, 256×256 images
+#
+# Features are precomputed ONCE and cached.
+#
+# Usage:
+#   Precompute features:
+#     python scripts/precompute_features.py --config configs/imagenet1k.yaml
+#   Distill:
+#     python scripts/distill.py --config configs/imagenet1k.yaml --ipc 10
+
+model:
+  dit_model_name: "facebook/DiT-XL-2-256"
+  vae_model_name: "stabilityai/sd-vae-ft-mse"
+  image_size: 256
+  latent_channels: 4
+  vae_scale_factor: 8
+  hidden_dim: 1152
+  num_blocks: 28
+  patch_size: 2
+  num_heads: 16
+  prediction_type: "v_prediction"
+  use_fp16: true            # FP16 for memory efficiency on ImageNet scale
+
+distillation:
+  ipc: 10
+  ddim_steps: 50
+  num_train_timesteps: 1000
+  cfg_scale: 1.5
+  batch_size: 10
+  deterministic: true
+  seed: 42
+
+hcdm:
+  layer_groups:
+    L1: [0, 8]
+    L2: [9, 18]
+    L3: [19, 27]
+
+  lambda_repel: 0.3          # Moderate repulsion (many classes → repulsion is implicit)
+  lambda_div: 0.1
+  div_margin: 0.05
+  inter_margin: 0.5
+  topk_hard_negatives: 5
+  mmd_kernel: "rbf"
+  mmd_median_heuristic: true
+  mmd_sigma: 1.0
+  normalize_features: true
+  grad_clip: 1.0
+  guidance_every_n_steps: 2  # Apply guidance every 2 steps (speed vs quality trade-off)
+
+guidance:
+  guidance_scale: 100.0
+  beta_alpha: 2.0
+  beta_beta: 2.0
+  level_centers:
+    L1: 0.10
+    L2: 0.40
+    L3: 0.75
+  level_sigmas:
+    L1: 0.12
+    L2: 0.18
+    L3: 0.15
+  min_weight: 0.01
+
+data:
+  dataset: "imagenet1k"
+  data_path: null            # Set to your ImageNet path
+  num_classes: 1000
+  samples_per_class: 500     # Half the typical class size for memory
+  precompute_batch_size: 16  # Smaller batch for ImageNet-scale memory
+  num_workers: 8
+  preprocess_resize: 256
+  preprocess_crop: 256
+
+output:
+  output_dir: "./outputs"
+  exp_name: "hcdm_imagenet1k"
+  use_wandb: true
+  wandb_project: "hcdm"
+  ckpt_dir: "./outputs/imagenet1k_checkpoints"
+  features_dir: "./outputs/imagenet1k_features.pt"
+  log_interval: 5
+  save_intermediate: false
+  save_format: "pt"

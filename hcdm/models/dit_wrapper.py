@@ -1,0 +1,432 @@
+"""
+DiT (Diffusion Transformer) model wrapper for HCDM.
+
+Encapsulates a pre-trained DiT model with VAE encoder/decoder
+and provides a clean interface for:
+- Encoding images to latent space
+- Noise prediction with classifier-free guidance
+- Multi-level feature extraction via transformer block hooks
+- DDIM sampling steps
+- Decoding latents back to pixel space
+
+Supports both v-prediction (standard DiT) and epsilon-prediction modes.
+"""
+
+import torch
+import torch.nn as nn
+from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
+
+
+class DiTWrapper:
+    """Wrapper around a DiT (Diffusion Transformer) model for HCDM.
+
+    Handles:
+    - VAE encoding/decoding
+    - Noise scheduling (DDPM cosine schedule)
+    - Noise prediction with optional CFG
+    - Multi-level feature extraction from specified transformer blocks
+    - DDIM reverse sampling
+
+    Usage:
+        dit = DiTWrapper(
+            dit_model_name="facebook/DiT-XL-2-256",
+            vae_model_name="stabilityai/sd-vae-ft-mse",
+            image_size=256,
+        )
+        # Pre-compute features
+        real_features = dit.extract_features(z_clean, class_labels)
+        # During distillation
+        eps = dit.predict_noise(z_t, t, class_labels, cfg_scale=1.5)
+    """
+
+    def __init__(
+        self,
+        dit_model_name: str = "facebook/DiT-XL-2-256",
+        vae_model_name: str = "stabilityai/sd-vae-ft-mse",
+        image_size: int = 256,
+        num_train_timesteps: int = 1000,
+        latent_channels: int = 4,
+        hidden_dim: int = 1152,
+        num_blocks: int = 28,
+        patch_size: int = 2,
+        num_heads: int = 16,
+        prediction_type: str = "v_prediction",
+        use_fp16: bool = True,
+        device: Optional[str] = None,
+    ):
+        """
+        Args:
+            dit_model_name: HuggingFace model ID or local path for DiT.
+            vae_model_name: HuggingFace model ID or local path for VAE.
+            image_size: Input image size (square).
+            num_train_timesteps: Number of diffusion timesteps used in training.
+            latent_channels: Number of VAE latent channels.
+            hidden_dim: DiT transformer hidden dimension.
+            num_blocks: Number of DiT transformer blocks.
+            patch_size: DiT patch size.
+            num_heads: Number of attention heads.
+            prediction_type: 'v_prediction' or 'epsilon'.
+            use_fp16: Use FP16 for VAE operations.
+            device: Device string (auto-detect if None).
+        """
+        self.image_size = image_size
+        self.num_train_timesteps = num_train_timesteps
+        self.latent_channels = latent_channels
+        self.hidden_dim = hidden_dim
+        self.num_blocks = num_blocks
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.prediction_type = prediction_type
+        self.use_fp16 = use_fp16
+
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        self.dtype = torch.float16 if use_fp16 else torch.float32
+
+        # Latent size after VAE encoding
+        self.vae_scale_factor = 8  # Standard for SD VAE
+        self.latent_size = image_size // self.vae_scale_factor
+
+        self._load_models(dit_model_name, vae_model_name)
+        self._setup_scheduler()
+
+    def _load_models(self, dit_model_name: str, vae_model_name: str):
+        """Load DiT and VAE models."""
+        try:
+            from diffusers import (
+                DiTTransformer2DModel,
+                AutoencoderKL,
+            )
+        except ImportError:
+            raise ImportError(
+                "diffusers is required. Install with: pip install diffusers"
+            )
+
+        # Load VAE
+        try:
+            self.vae = AutoencoderKL.from_pretrained(vae_model_name).to(
+                self.device, dtype=self.dtype
+            )
+            self.vae.eval()
+            for param in self.vae.parameters():
+                param.requires_grad = False
+        except Exception as e:
+            print(f"Could not load VAE from {vae_model_name}: {e}")
+            print("VAE will need to be set manually via set_vae()")
+            self.vae = None
+
+        # Load DiT transformer
+        try:
+            self.transformer = DiTTransformer2DModel.from_pretrained(
+                dit_model_name,
+                subfolder="transformer",
+            ).to(self.device, dtype=self.dtype)
+            self.transformer.eval()
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+        except Exception as e:
+            print(f"Could not load DiT from {dit_model_name}: {e}")
+            print("DiT transformer will need to be set manually via set_transformer()")
+            self.transformer = None
+
+        # Determine actual parameters from loaded models
+        if self.transformer is not None:
+            config = self.transformer.config
+            self.hidden_dim = getattr(config, 'hidden_size', self.hidden_dim)
+            self.num_blocks = getattr(config, 'num_layers', self.num_blocks)
+            self.num_heads = getattr(config, 'num_attention_heads', self.num_heads)
+            self.patch_size = getattr(config, 'patch_size', self.patch_size)
+
+    def _setup_scheduler(self):
+        """Setup noise scheduler (cosine schedule used by DiT)."""
+        # Cosine schedule following DiT paper
+        betas = self._cosine_beta_schedule(self.num_train_timesteps)
+        alphas = 1.0 - betas
+        self.alphas_cumprod = torch.cumprod(alphas, dim=0).to(self.device)
+        self.alphas_cumprod_prev = torch.cat([
+            torch.tensor([1.0]).to(self.device),
+            self.alphas_cumprod[:-1]
+        ])
+
+    @staticmethod
+    def _cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
+        """Cosine beta schedule as used in DiT.
+
+        Args:
+            timesteps: Number of timesteps.
+            s: Small offset to prevent singularities.
+
+        Returns:
+            Beta values [timesteps].
+        """
+        import math
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps)
+        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clamp(betas, max=0.999)
+
+    def set_vae(self, vae: nn.Module):
+        """Set VAE manually (useful if auto-loading fails)."""
+        self.vae = vae.to(self.device, dtype=self.dtype)
+        self.vae.eval()
+        for param in self.vae.parameters():
+            param.requires_grad = False
+
+    def set_transformer(self, transformer: nn.Module):
+        """Set DiT transformer manually."""
+        self.transformer = transformer.to(self.device, dtype=self.dtype)
+        self.transformer.eval()
+        for param in self.transformer.parameters():
+            param.requires_grad = False
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode images to latent space.
+
+        Args:
+            x: Images [B, 3, H, W] in [-1, 1].
+
+        Returns:
+            Latents [B, C_lat, H_lat, W_lat].
+        """
+        if self.vae is None:
+            raise RuntimeError("VAE not loaded. Call set_vae() first.")
+
+        with torch.no_grad():
+            # VAE encode
+            posterior = self.vae.encode(x)
+            if hasattr(posterior, 'latent_dist'):
+                z = posterior.latent_dist.sample()
+            else:
+                z = posterior
+            # Scale factor (standard for SD VAE)
+            z = z * self.vae.config.scaling_factor
+        return z
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode latents back to pixel space.
+
+        Args:
+            z: Latents [B, C_lat, H_lat, W_lat].
+
+        Returns:
+            Images [B, 3, H, W] in [-1, 1].
+        """
+        if self.vae is None:
+            raise RuntimeError("VAE not loaded.")
+
+        with torch.no_grad():
+            z = z / self.vae.config.scaling_factor
+            x = self.vae.decode(z)
+            if hasattr(x, 'sample'):
+                x = x.sample
+        return x
+
+    def predict_noise(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        class_labels: torch.Tensor,
+        cfg_scale: float = 1.5,
+    ) -> torch.Tensor:
+        """Predict noise (or v) using DiT with classifier-free guidance.
+
+        Args:
+            z_t: Noisy latents [B, C, H, W].
+            t: Timesteps [B] (int).
+            class_labels: Class indices [B].
+            cfg_scale: CFG scale (1.0 = no CFG, 1.5 = standard for DiT).
+
+        Returns:
+            Predicted noise/v [B, C, H, W].
+        """
+        if self.transformer is None:
+            raise RuntimeError("DiT transformer not loaded.")
+
+        # Prepare for DiT forward
+        # DiT expects latents of shape [B, C, H, W]
+        # and timesteps as [B] long, class labels as [B] long
+
+        # Unconditional prediction
+        if cfg_scale != 1.0:
+            # Get unconditional model output
+            # For DiT, we can pass class_labels=-1 or 1000 for unconditional
+            null_labels = torch.full_like(class_labels, 1000)  # DiT null class
+            noise_uncond = self.transformer(
+                z_t.to(dtype=self.dtype),
+                timestep=t,
+                class_labels=null_labels,
+            ).sample
+
+            if cfg_scale == 1.0:
+                return noise_uncond
+
+            # Conditional prediction
+            noise_cond = self.transformer(
+                z_t.to(dtype=self.dtype),
+                timestep=t,
+                class_labels=class_labels,
+            ).sample
+
+            # CFG: ε = ε_uncond + w * (ε_cond - ε_uncond)
+            noise = noise_uncond + cfg_scale * (noise_cond - noise_uncond)
+        else:
+            noise = self.transformer(
+                z_t.to(dtype=self.dtype),
+                timestep=t,
+                class_labels=class_labels,
+            ).sample
+
+        return noise.float()
+
+    def extract_features(
+        self,
+        z: torch.Tensor,
+        class_labels: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        layer_groups: Optional[Dict[str, Tuple[int, int]]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Extract multi-level features from DiT transformer blocks.
+
+        Registers forward hooks on specified block groups and runs a
+        forward pass to collect intermediate representations.
+
+        Args:
+            z: Latents [B, C, H, W] (usually clean latents, t≈0).
+            class_labels: Class indices [B].
+            t: Timesteps [B]. If None, uses t=0 (clean).
+            layer_groups: Dict of {level_name: (start_idx, end_idx)}.
+                          Default splits into 3 groups.
+
+        Returns:
+            Dict of {level_name: Tensor[B, D]} where D = hidden_dim.
+            Features are mean-pooled over spatial (patch) dimensions.
+        """
+        if self.transformer is None:
+            raise RuntimeError("DiT transformer not loaded.")
+
+        if layer_groups is None:
+            # Default 3-level split
+            layer_groups = {
+                "L1": (0, self.num_blocks // 3),
+                "L2": (self.num_blocks // 3, 2 * self.num_blocks // 3),
+                "L3": (2 * self.num_blocks // 3, self.num_blocks),
+            }
+
+        if t is None:
+            t = torch.zeros(z.size(0), dtype=torch.long, device=z.device)
+
+        # Register hooks on the LAST block of each group
+        features = {}
+        hooks = []
+
+        for level_name, (start, end) in layer_groups.items():
+            # Use the last block in the group for feature extraction
+            hook_block_idx = end - 1
+            if hook_block_idx >= len(self.transformer.transformer_blocks):
+                hook_block_idx = len(self.transformer.transformer_blocks) - 1
+
+            def make_hook(name):
+                def hook_fn(module, input, output):
+                    # output: hidden states [B, N_patches, hidden_dim]
+                    features[name] = output.detach()
+                return hook_fn
+
+            block = self.transformer.transformer_blocks[hook_block_idx]
+            handle = block.register_forward_hook(make_hook(level_name))
+            hooks.append(handle)
+
+        # Forward pass
+        with torch.no_grad():
+            self.transformer(
+                z.to(dtype=self.dtype),
+                timestep=t,
+                class_labels=class_labels,
+            )
+
+        # Remove hooks
+        for handle in hooks:
+            handle.remove()
+
+        # Mean-pool over patches [B, N_patches, D] → [B, D]
+        pooled = {}
+        for level_name, feat in features.items():
+            pooled[level_name] = feat.float().mean(dim=1)
+
+        return pooled
+
+    def ddim_step(
+        self,
+        z_t: torch.Tensor,
+        eps: torch.Tensor,
+        t: int,
+        next_t: int,
+        eta: float = 0.0,
+    ) -> torch.Tensor:
+        """Single deterministic DDIM reverse step.
+
+        Args:
+            z_t: Current latent [B, C, H, W].
+            eps: Noise prediction [B, C, H, W].
+            t: Current timestep index.
+            next_t: Next timestep index.
+            eta: Stochasticity (0 = deterministic).
+
+        Returns:
+            z_{t-1} [B, C, H, W].
+        """
+        alpha_bar_t = self.alphas_cumprod[t]
+        alpha_bar_next = self.alphas_cumprod[next_t] if next_t >= 0 else torch.tensor(1.0, device=z_t.device)
+
+        # Predict z_0
+        if self.prediction_type == "v_prediction":
+            z_0_pred = self._predict_x0_from_v(z_t, eps, alpha_bar_t)
+        else:
+            z_0_pred = self._predict_x0_from_eps(z_t, eps, alpha_bar_t)
+
+        # DDIM direction
+        direction = torch.sqrt(1.0 - alpha_bar_next - eta**2) * eps
+        z_next = torch.sqrt(alpha_bar_next) * z_0_pred + direction
+
+        if eta > 0:
+            z_next = z_next + eta * torch.randn_like(z_t)
+
+        return z_next
+
+    def _predict_x0_from_v(self, z_t, v_pred, alpha_bar_t):
+        """Estimate z_0 from v-prediction."""
+        sqrt_alpha = torch.sqrt(alpha_bar_t)
+        sqrt_one_minus = torch.sqrt(1.0 - alpha_bar_t)
+        return sqrt_alpha * z_t - sqrt_one_minus * v_pred
+
+    def _predict_x0_from_eps(self, z_t, eps_pred, alpha_bar_t):
+        """Estimate z_0 from epsilon-prediction."""
+        sqrt_alpha = torch.sqrt(alpha_bar_t)
+        sqrt_one_minus = torch.sqrt(1.0 - alpha_bar_t)
+        return (z_t - sqrt_one_minus * eps_pred) / sqrt_alpha
+
+    def get_alpha_bar(self, t: int) -> float:
+        """Get cumulative alpha product at timestep t."""
+        return self.alphas_cumprod[t].item()
+
+    @property
+    def device_info(self) -> str:
+        return str(self.device)
+
+    def __repr__(self) -> str:
+        return (
+            f"DiTWrapper(\n"
+            f"  image_size={self.image_size},\n"
+            f"  latent_size={self.latent_size},\n"
+            f"  latent_channels={self.latent_channels},\n"
+            f"  hidden_dim={self.hidden_dim},\n"
+            f"  num_blocks={self.num_blocks},\n"
+            f"  prediction_type={self.prediction_type},\n"
+            f"  device={self.device}\n"
+            f")"
+        )
