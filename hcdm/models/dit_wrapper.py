@@ -386,6 +386,7 @@ class DiTWrapper:
         class_labels: torch.Tensor,
         t: Optional[torch.Tensor] = None,
         layer_groups: Optional[Dict[str, Tuple[int, int]]] = None,
+        with_grad: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Extract multi-level features from DiT transformer blocks.
 
@@ -397,7 +398,8 @@ class DiTWrapper:
             class_labels: Class indices [B].
             t: Timesteps [B]. If None, uses t=0 (clean).
             layer_groups: Dict of {level_name: (start_idx, end_idx)}.
-                          Default splits into 3 groups.
+            with_grad: If True, preserves gradient flow through the model.
+                       Required for HCDM guidance gradient computation.
 
         Returns:
             Dict of {level_name: Tensor[B, D]} where D = hidden_dim.
@@ -422,23 +424,26 @@ class DiTWrapper:
         hooks = []
 
         for level_name, (start, end) in layer_groups.items():
-            # Use the last block in the group for feature extraction
             hook_block_idx = end - 1
             if hook_block_idx >= len(self.transformer.transformer_blocks):
                 hook_block_idx = len(self.transformer.transformer_blocks) - 1
 
-            def make_hook(name):
+            def make_hook(name, needs_grad):
                 def hook_fn(module, input, output):
                     # output: hidden states [B, N_patches, hidden_dim]
-                    features[name] = output.detach()
+                    if needs_grad:
+                        features[name] = output  # preserve grad
+                    else:
+                        features[name] = output.detach()
                 return hook_fn
 
             block = self.transformer.transformer_blocks[hook_block_idx]
-            handle = block.register_forward_hook(make_hook(level_name))
+            handle = block.register_forward_hook(make_hook(level_name, with_grad))
             hooks.append(handle)
 
         # Forward pass
-        with torch.no_grad():
+        ctx = torch.enable_grad() if with_grad else torch.no_grad()
+        with ctx:
             self.transformer(
                 z.to(dtype=self.dtype),
                 timestep=t,

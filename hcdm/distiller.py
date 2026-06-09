@@ -205,11 +205,12 @@ class HCDMDistiller:
                         eps_detached = eps.detach()
                         z_0_pred = self.dit._predict_x0_from_eps(z_t_grad, eps_detached, alpha_bar_t)
 
-                    # Extract multi-level features
+                    # Extract multi-level features WITH gradient tracking
                     synth_features = self.feature_extractor.extract(
                         z_0_pred,
                         class_labels,
                         t=torch.zeros(m, dtype=torch.long, device=self.device),
+                        with_grad=True,
                     )
 
                     # Compute HCDM loss (real features moved to device inside)

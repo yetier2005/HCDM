@@ -51,6 +51,7 @@ class FeatureExtractor:
         z: torch.Tensor,
         class_labels: torch.Tensor,
         t: Optional[torch.Tensor] = None,
+        with_grad: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Extract multi-level features from a batch of latents.
 
@@ -58,6 +59,7 @@ class FeatureExtractor:
             z: Latents [B, C, H, W].
             class_labels: Class indices [B].
             t: Timesteps [B]. None = use t=0.
+            with_grad: Preserve gradient flow if True (for guidance).
 
         Returns:
             Dict {level_name: Tensor[B, D]}. Features are mean-pooled.
@@ -67,6 +69,7 @@ class FeatureExtractor:
             class_labels=class_labels,
             t=t,
             layer_groups=self.layer_groups,
+            with_grad=with_grad,
         )
 
         if self.normalize_output:
