@@ -87,6 +87,10 @@ class DiTWrapper:
 
         self.dtype = torch.float16 if use_fp16 else torch.float32
 
+        # DiT output channels (may differ from latent_channels in non-standard models)
+        # None means "same as latent_channels" — set by _validate_output_shape()
+        self.dit_output_channels = None
+
         # Latent size after VAE encoding
         self.vae_scale_factor = 8  # Standard for SD VAE
         self.latent_size = image_size // self.vae_scale_factor
@@ -235,13 +239,17 @@ class DiTWrapper:
 
                 if actual_channels != self.latent_channels:
                     print(f"  *** Shape mismatch detected! ***")
-                    print(f"  Input channels:  {self.latent_channels}")
-                    print(f"  Output channels: {actual_channels}")
+                    print(f"  Input channels (VAE latent):   {self.latent_channels}")
+                    print(f"  Output channels (DiT predict): {actual_channels}")
                     print(f"  Model output shape: {tuple(out_tensor.shape)}")
-                    print(f"  Auto-correcting latent_channels: "
-                          f"{self.latent_channels} → {actual_channels}")
-                    self.latent_channels = actual_channels
+                    # IMPORTANT: Do NOT change latent_channels (it must match VAE
+                    # output for encoding/decoding). Instead, store the DiT output
+                    # channels separately and slice during reverse diffusion.
+                    self.dit_output_channels = actual_channels
+                    print(f"  Stored dit_output_channels={self.dit_output_channels}, "
+                          f"will slice predictions to match z_t during sampling")
                 else:
+                    self.dit_output_channels = actual_channels
                     print(f"  Shape validation passed: "
                           f"input={dummy_z.shape} → output={out_tensor.shape}")
 
@@ -363,9 +371,12 @@ class DiTWrapper:
                       f"output noise shape={tuple(noise.shape)}")
                 print(f"  Channel mismatch: z_t has {z_t.shape[1]}, "
                       f"DiT outputs {noise.shape[1]} channels")
-                print(f"  Updating latent_channels: {self.latent_channels} → {noise.shape[1]}")
-                self.latent_channels = noise.shape[1]
+                print(f"  Storing dit_output_channels={noise.shape[1]}, "
+                      f"slicing prediction to first {z_t.shape[1]} channels")
+                self.dit_output_channels = noise.shape[1]
                 self._shape_warned = True
+            # Slice to match z_t channels for reverse diffusion
+            noise = noise[:, :z_t.shape[1], :, :]
 
         return noise
 
