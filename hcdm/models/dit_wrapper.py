@@ -154,21 +154,14 @@ class DiTWrapper:
             self.patch_size = getattr(config, 'patch_size', self.patch_size)
 
             # IMPORTANT: detect actual in_channels from DiT config
-            # DiT may use different channel counts depending on variant
             detected_in_channels = getattr(config, 'in_channels', None)
             if detected_in_channels is not None and detected_in_channels != self.latent_channels:
                 print(f"  Detected DiT in_channels={detected_in_channels} "
                       f"(config had {self.latent_channels}, auto-correcting)")
                 self.latent_channels = detected_in_channels
-                self.latent_size = self.image_size // self.vae_scale_factor
 
-            # Also detect from VAE if available
-            if self.vae is not None:
-                vae_config = self.vae.config
-                vae_latent_channels = getattr(vae_config, 'latent_channels', None)
-                if vae_latent_channels is not None and vae_latent_channels != self.latent_channels:
-                    print(f"  Detected VAE latent_channels={vae_latent_channels} "
-                          f"(DiT in_channels={self.latent_channels})")
+            # Validate actual output shape with a dummy forward pass
+            self._validate_output_shape()
 
             print(f"  Effective config: in_channels={self.latent_channels}, "
                   f"hidden_dim={self.hidden_dim}, num_blocks={self.num_blocks}, "
@@ -203,6 +196,58 @@ class DiTWrapper:
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         return torch.clamp(betas, max=0.999)
+
+    def _validate_output_shape(self):
+        """Run a dummy forward pass to detect the actual output channels.
+
+        The DiT config may report in_channels=4, but the actual loaded model
+        (depending on diffusers version) may output a different number of
+        channels. This method runs a minimal forward pass and corrects
+        self.latent_channels to match reality.
+        """
+        if self.transformer is None:
+            return
+
+        try:
+            with torch.no_grad():
+                # Create dummy input matching current assumed shape
+                dummy_z = torch.zeros(
+                    1, self.latent_channels,
+                    self.latent_size, self.latent_size,
+                    device=self.device, dtype=self.dtype,
+                )
+                dummy_t = torch.zeros(1, dtype=torch.long, device=self.device)
+                dummy_y = torch.zeros(1, dtype=torch.long, device=self.device)
+
+                output = self.transformer(
+                    dummy_z,
+                    timestep=dummy_t,
+                    class_labels=dummy_y,
+                )
+
+                # Handle both dict-style and tensor outputs
+                if hasattr(output, 'sample'):
+                    out_tensor = output.sample
+                else:
+                    out_tensor = output
+
+                actual_channels = out_tensor.shape[1]
+
+                if actual_channels != self.latent_channels:
+                    print(f"  *** Shape mismatch detected! ***")
+                    print(f"  Input channels:  {self.latent_channels}")
+                    print(f"  Output channels: {actual_channels}")
+                    print(f"  Model output shape: {tuple(out_tensor.shape)}")
+                    print(f"  Auto-correcting latent_channels: "
+                          f"{self.latent_channels} → {actual_channels}")
+                    self.latent_channels = actual_channels
+                else:
+                    print(f"  Shape validation passed: "
+                          f"input={dummy_z.shape} → output={out_tensor.shape}")
+
+        except Exception as e:
+            print(f"  Shape validation skipped (could not run forward pass): {e}")
+            print(f"  Assuming latent_channels={self.latent_channels}")
 
     def set_vae(self, vae: nn.Module):
         """Set VAE manually (useful if auto-loading fails)."""
@@ -276,46 +321,53 @@ class DiTWrapper:
             cfg_scale: CFG scale (1.0 = no CFG, 1.5 = standard for DiT).
 
         Returns:
-            Predicted noise/v [B, C, H, W].
+            Predicted noise/v [B, C_out, H, W].
         """
         if self.transformer is None:
             raise RuntimeError("DiT transformer not loaded.")
 
-        # Prepare for DiT forward
-        # DiT expects latents of shape [B, C, H, W]
-        # and timesteps as [B] long, class labels as [B] long
+        def _call_transformer(z, t_val, y_val):
+            """Call transformer and extract tensor from output."""
+            raw = self.transformer(
+                z.to(dtype=self.dtype),
+                timestep=t_val,
+                class_labels=y_val,
+            )
+            # Handle various output formats
+            if hasattr(raw, 'sample') and raw.sample is not None:
+                return raw.sample.float()
+            elif isinstance(raw, torch.Tensor):
+                return raw.float()
+            elif isinstance(raw, dict):
+                # Try common keys
+                for key in ['sample', 'hidden_states', 'latent', 'output']:
+                    if key in raw and raw[key] is not None:
+                        return raw[key].float()
+            raise ValueError(
+                f"Unexpected transformer output type: {type(raw)}. "
+                f"Keys: {dir(raw) if hasattr(raw, 'keys') else 'N/A'}"
+            )
 
-        # Unconditional prediction
         if cfg_scale != 1.0:
-            # Get unconditional model output
-            # For DiT, we can pass class_labels=-1 or 1000 for unconditional
-            null_labels = torch.full_like(class_labels, 1000)  # DiT null class
-            noise_uncond = self.transformer(
-                z_t.to(dtype=self.dtype),
-                timestep=t,
-                class_labels=null_labels,
-            ).sample
-
-            if cfg_scale == 1.0:
-                return noise_uncond
-
-            # Conditional prediction
-            noise_cond = self.transformer(
-                z_t.to(dtype=self.dtype),
-                timestep=t,
-                class_labels=class_labels,
-            ).sample
-
-            # CFG: ε = ε_uncond + w * (ε_cond - ε_uncond)
+            null_labels = torch.full_like(class_labels, 1000)
+            noise_uncond = _call_transformer(z_t, t, null_labels)
+            noise_cond = _call_transformer(z_t, t, class_labels)
             noise = noise_uncond + cfg_scale * (noise_cond - noise_uncond)
         else:
-            noise = self.transformer(
-                z_t.to(dtype=self.dtype),
-                timestep=t,
-                class_labels=class_labels,
-            ).sample
+            noise = _call_transformer(z_t, t, class_labels)
 
-        return noise.float()
+        # Detect and handle shape mismatch between input and output
+        if noise.shape[1] != z_t.shape[1]:
+            if not hasattr(self, '_shape_warned'):
+                print(f"  predict_noise: input z_t shape={tuple(z_t.shape)}, "
+                      f"output noise shape={tuple(noise.shape)}")
+                print(f"  Channel mismatch: z_t has {z_t.shape[1]}, "
+                      f"DiT outputs {noise.shape[1]} channels")
+                print(f"  Updating latent_channels: {self.latent_channels} → {noise.shape[1]}")
+                self.latent_channels = noise.shape[1]
+                self._shape_warned = True
+
+        return noise
 
     def extract_features(
         self,

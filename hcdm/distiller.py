@@ -130,7 +130,19 @@ class HCDMDistiller:
         m = self.ipc
         class_labels = torch.full((m,), class_c, dtype=torch.long, device=self.device)
 
-        # Initialize noise
+        # Warmup: run a single forward pass to auto-detect actual DiT output channels
+        # (config may say 4 but loaded model may output 8, depending on diffusers version)
+        dummy_z = torch.randn(
+            1, self.dit.latent_channels,
+            self.dit.latent_size, self.dit.latent_size,
+            device=self.device,
+        )
+        dummy_t = torch.zeros(1, dtype=torch.long, device=self.device)
+        dummy_y = torch.zeros(1, dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            _ = self.dit.predict_noise(dummy_z, dummy_t, dummy_y, cfg_scale=1.0)
+
+        # Initialize noise with (possibly corrected) channel count
         z_t = torch.randn(m, self.dit.latent_channels,
                          self.dit.latent_size, self.dit.latent_size,
                          device=self.device)
