@@ -170,19 +170,14 @@ class HCDMDistiller:
                     z_t_grad = z_t.detach().clone()
                     z_t_grad.requires_grad_(True)
 
-                    # Estimate z_0
-                    alpha_bar_t = self.dit.get_alpha_bar(t)
+                    # Estimate z_0 using model's built-in converter
+                    alpha_bar_t = self.dit.get_alpha_bar(t, as_tensor=True)
                     if self.dit.prediction_type == "v_prediction":
                         v_pred = eps.detach()
-                        z_0_pred = (
-                            torch.sqrt(torch.tensor(alpha_bar_t)) * z_t_grad -
-                            torch.sqrt(torch.tensor(1.0 - alpha_bar_t)) * v_pred
-                        )
+                        z_0_pred = self.dit._predict_x0_from_v(z_t_grad, v_pred, alpha_bar_t)
                     else:
                         eps_detached = eps.detach()
-                        z_0_pred = (
-                            z_t_grad - torch.sqrt(torch.tensor(1.0 - alpha_bar_t)) * eps_detached
-                        ) / torch.sqrt(torch.tensor(alpha_bar_t))
+                        z_0_pred = self.dit._predict_x0_from_eps(z_t_grad, eps_detached, alpha_bar_t)
 
                     # Extract multi-level features
                     synth_features = self.feature_extractor.extract(

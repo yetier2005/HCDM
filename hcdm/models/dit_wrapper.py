@@ -108,29 +108,41 @@ class DiTWrapper:
 
         # Load VAE
         try:
-            self.vae = AutoencoderKL.from_pretrained(vae_model_name).to(
-                self.device, dtype=self.dtype
-            )
+            vae_load_kwargs = {}
+            self.vae = AutoencoderKL.from_pretrained(
+                vae_model_name, **vae_load_kwargs
+            ).to(self.device, dtype=self.dtype)
             self.vae.eval()
             for param in self.vae.parameters():
                 param.requires_grad = False
+            print(f"  VAE loaded: {type(self.vae).__name__}")
         except Exception as e:
-            print(f"Could not load VAE from {vae_model_name}: {e}")
-            print("VAE will need to be set manually via set_vae()")
+            print(f"  Could not load VAE from {vae_model_name}: {e}")
+            print("  VAE will need to be set manually via set_vae()")
             self.vae = None
 
         # Load DiT transformer
-        try:
-            self.transformer = DiTTransformer2DModel.from_pretrained(
-                dit_model_name,
-                subfolder="transformer",
-            ).to(self.device, dtype=self.dtype)
-            self.transformer.eval()
-            for param in self.transformer.parameters():
-                param.requires_grad = False
-        except Exception as e:
-            print(f"Could not load DiT from {dit_model_name}: {e}")
-            print("DiT transformer will need to be set manually via set_transformer()")
+        # Try multiple loading strategies
+        load_strategies = [
+            {},                                          # direct load
+            {"subfolder": "transformer"},                 # nested in transformer/
+        ]
+        for strategy in load_strategies:
+            try:
+                self.transformer = DiTTransformer2DModel.from_pretrained(
+                    dit_model_name, **strategy
+                ).to(self.device, dtype=self.dtype)
+                self.transformer.eval()
+                for param in self.transformer.parameters():
+                    param.requires_grad = False
+                print(f"  DiT loaded with strategy: {strategy if strategy else 'direct'}")
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        else:
+            print(f"  Could not load DiT from {dit_model_name}: {last_error}")
+            print("  DiT transformer will need to be set manually via set_transformer()")
             self.transformer = None
 
         # Determine actual parameters from loaded models
@@ -140,6 +152,27 @@ class DiTWrapper:
             self.num_blocks = getattr(config, 'num_layers', self.num_blocks)
             self.num_heads = getattr(config, 'num_attention_heads', self.num_heads)
             self.patch_size = getattr(config, 'patch_size', self.patch_size)
+
+            # IMPORTANT: detect actual in_channels from DiT config
+            # DiT may use different channel counts depending on variant
+            detected_in_channels = getattr(config, 'in_channels', None)
+            if detected_in_channels is not None and detected_in_channels != self.latent_channels:
+                print(f"  Detected DiT in_channels={detected_in_channels} "
+                      f"(config had {self.latent_channels}, auto-correcting)")
+                self.latent_channels = detected_in_channels
+                self.latent_size = self.image_size // self.vae_scale_factor
+
+            # Also detect from VAE if available
+            if self.vae is not None:
+                vae_config = self.vae.config
+                vae_latent_channels = getattr(vae_config, 'latent_channels', None)
+                if vae_latent_channels is not None and vae_latent_channels != self.latent_channels:
+                    print(f"  Detected VAE latent_channels={vae_latent_channels} "
+                          f"(DiT in_channels={self.latent_channels})")
+
+            print(f"  Effective config: in_channels={self.latent_channels}, "
+                  f"hidden_dim={self.hidden_dim}, num_blocks={self.num_blocks}, "
+                  f"patch_size={self.patch_size}")
 
     def _setup_scheduler(self):
         """Setup noise scheduler (cosine schedule used by DiT)."""
@@ -410,9 +443,17 @@ class DiTWrapper:
         sqrt_one_minus = torch.sqrt(1.0 - alpha_bar_t)
         return (z_t - sqrt_one_minus * eps_pred) / sqrt_alpha
 
-    def get_alpha_bar(self, t: int) -> float:
-        """Get cumulative alpha product at timestep t."""
-        return self.alphas_cumprod[t].item()
+    def get_alpha_bar(self, t: int, as_tensor: bool = True) -> torch.Tensor:
+        """Get cumulative alpha product at timestep t.
+
+        Args:
+            t: Timestep index.
+            as_tensor: Return as tensor on self.device (True) or float (False).
+        """
+        val = self.alphas_cumprod[t]
+        if as_tensor:
+            return val.clone().detach().to(self.device)
+        return val.item()
 
     @property
     def device_info(self) -> str:
