@@ -185,16 +185,17 @@ def diagnose_channel_mismatch(dit: DiTWrapper, device):
     last4 = out_tensor[:, 4:, :, :]
     print(f"  First 4ch: mean={first4.mean():.4f}, std={first4.std():.4f}")
     print(f"  Last 4ch:  mean={last4.mean():.4f}, std={last4.std():.4f}")
-    print(f"  Corr(first4, last4) = {torch.corrcoef(
-        torch.stack([first4.flatten(), last4.flatten()]))[0,1]:.4f}")
+    # Corr between first 4 and last 4 channel groups
+    f4 = first4.flatten()
+    l4 = last4.flatten()
+    corr_4 = torch.corrcoef(torch.stack([f4, l4]))[0, 1]
+    print(f"  Corr(first4, last4) = {corr_4:.4f}")
 
     # Check if output channels are paired somehow
-    # Maybe channel 0,4 pair? 1,5? etc.
     for i in range(4):
-        corr = torch.corrcoef(
-            torch.stack([out_tensor[:, i, :, :].flatten(),
-                        out_tensor[:, i+4, :, :].flatten()])
-        )[0, 1]
+        ci = out_tensor[:, i, :, :].flatten()
+        cj = out_tensor[:, i+4, :, :].flatten()
+        corr = torch.corrcoef(torch.stack([ci, cj]))[0, 1]
         print(f"  Ch{i} ↔ Ch{i+4} correlation: {corr:.4f}")
 
     # Maybe the expected output shape is different
