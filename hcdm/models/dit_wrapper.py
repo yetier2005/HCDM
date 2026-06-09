@@ -371,12 +371,22 @@ class DiTWrapper:
                       f"output noise shape={tuple(noise.shape)}")
                 print(f"  Channel mismatch: z_t has {z_t.shape[1]}, "
                       f"DiT outputs {noise.shape[1]} channels")
-                print(f"  Storing dit_output_channels={noise.shape[1]}, "
-                      f"slicing prediction to first {z_t.shape[1]} channels")
+                # Try first-4, then last-4 — pick the one with higher variance
+                var_first4 = noise[:, :z_t.shape[1], :, :].var().item()
+                var_last4 = noise[:, noise.shape[1]-z_t.shape[1]:, :, :].var().item()
+                print(f"  First {z_t.shape[1]}ch var={var_first4:.4f}, "
+                      f"Last {z_t.shape[1]}ch var={var_last4:.4f}")
+                if var_last4 > var_first4:
+                    print(f"  Using LAST {z_t.shape[1]} channels (higher variance)")
+                    self._slice_offset = noise.shape[1] - z_t.shape[1]
+                else:
+                    print(f"  Using FIRST {z_t.shape[1]} channels")
+                    self._slice_offset = 0
                 self.dit_output_channels = noise.shape[1]
                 self._shape_warned = True
-            # Slice to match z_t channels for reverse diffusion
-            noise = noise[:, :z_t.shape[1], :, :]
+            # Slice to match z_t channels
+            offset = getattr(self, '_slice_offset', 0)
+            noise = noise[:, offset:offset + z_t.shape[1], :, :]
 
         return noise
 
