@@ -142,6 +142,20 @@ class HCDMDistiller:
         with torch.no_grad():
             _ = self.dit.predict_noise(dummy_z, dummy_t, dummy_y, cfg_scale=1.0)
 
+        # Move current class real features to device
+        real_features_class_dev = {
+            level: feat.to(self.device)
+            for level, feat in self.real_features[class_c].items()
+        }
+
+        # Pre-compute class mean features on device for fast hard-negative screening
+        class_means_dev = {}
+        for c, feats in self.real_features.items():
+            class_means_dev[c] = {
+                level: feat.mean(dim=0, keepdim=True).to(self.device)
+                for level, feat in feats.items()
+            }
+
         # Initialize noise with VAE latent channels (model input, NOT output)
         z_t = torch.randn(m, self.dit.latent_channels,
                          self.dit.latent_size, self.dit.latent_size,
@@ -198,8 +212,8 @@ class HCDMDistiller:
                         t=torch.zeros(m, dtype=torch.long, device=self.device),
                     )
 
-                    # Compute HCDM loss
-                    real_features_class = self.real_features[class_c]
+                    # Compute HCDM loss (real features moved to device inside)
+                    real_features_class = real_features_class_dev
 
                     loss_hcdm = compute_hcdm_loss(
                         synth_features=synth_features,

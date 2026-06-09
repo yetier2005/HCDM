@@ -277,10 +277,11 @@ def compute_inter_class_loss(
         f_s_mean = F.normalize(f_s_mean, p=2, dim=-1)
 
     class_distances = {}
+    device = f_s_mean.device
     for c_neg, feats in all_real_features.items():
         if c_neg == class_c:
             continue
-        f_r_mean = feats[screen_level].mean(dim=0, keepdim=True)
+        f_r_mean = feats[screen_level].mean(dim=0, keepdim=True).to(device)
         if normalize:
             f_r_mean = F.normalize(f_r_mean, p=2, dim=-1)
         dist = torch.norm(f_s_mean - f_r_mean, dim=-1).item()
@@ -294,7 +295,7 @@ def compute_inter_class_loss(
         w = level_weights.get(level, 1.0)
 
         for c_neg in hard_negatives:
-            f_r_neg = all_real_features[c_neg][level]
+            f_r_neg = all_real_features[c_neg][level].to(f_s.device)
             mmd_val = compute_mmd(f_s, f_r_neg, kernel=kernel, normalize=normalize)
 
             # Hinge loss: L = max(0, margin - MMD²)
